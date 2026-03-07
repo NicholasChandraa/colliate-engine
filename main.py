@@ -1,10 +1,29 @@
 import os
+import sys
+import asyncio
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.api.routes import video_router, job_router
 from app.core.config import get_settings
+
+# Silence annoying [WinError 10054] when clients abruptly close video streams
+if sys.platform == "win32":
+    from asyncio.proactor_events import _ProactorBasePipeTransport
+    
+    _original_call_connection_lost = _ProactorBasePipeTransport._call_connection_lost
+    
+    def _silenced_call_connection_lost(self, exc):
+        try:
+            _original_call_connection_lost(self, exc)
+        except ConnectionResetError as e:
+            if e.winerror == 10054:
+                pass
+            else:
+                raise
+                
+    _ProactorBasePipeTransport._call_connection_lost = _silenced_call_connection_lost
 
 app = FastAPI(
     title="Video Ad Generator",
@@ -38,4 +57,4 @@ if __name__ == "__main__":
     import uvicorn
 
     reload = True if settings.APP_ENV == "development" else False
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=reload)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)

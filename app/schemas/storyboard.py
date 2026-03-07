@@ -10,8 +10,9 @@ class Shot(BaseModel):
     emotion: str = Field(..., description="e.g. 'confident', 'curious', 'joyful'")
     include_product: bool = Field(..., description="Whether the product should appear in this shot")
     image_prompt: str = Field(..., description="Static photorealistic description for initial scene")
-    video_prompt: str = Field(..., description="Cinematic physics/motion description for Veo 3.1")
+    video_prompt: str = Field(..., description="Cinematic physics/motion description for Veo 3.1. SFX and ambient music only — NO voiceover, NO dialogue.")
     negative_prompt: str = Field(..., description="Elements to exclude from the video (no 'no/don't', just describe)")
+    voiceover_text: str = Field(..., description="Script voiceover bahasa Indonesia untuk TTS. Maks 2 kalimat pendek, tone klinis & edukatif.")
 
 
 class Storyboard(BaseModel):

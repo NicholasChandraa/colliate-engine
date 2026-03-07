@@ -10,11 +10,14 @@ class JobStatus(str, PyEnum):
     PENDING = "pending"
     RESEARCHING = "researching"
     DIRECTING = "directing"
-    GENERATING = "generating"  # image + video loop
+    GENERATING_IMAGES = "generating_images"   # Task 1: generating 2 images per shot
+    AWAITING_SELECTION = "awaiting_selection" # Task 1 done, waiting for user to select images
+    GENERATING_VIDEOS = "generating_videos"   # Task 2: generating video clips for selected shots
     ASSEMBLING = "assembling"
     DONE = "done"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    REJECTED = "rejected"  # product failed safety/quality review
 
 class Job(Base):
     __tablename__: str = "jobs"
@@ -23,8 +26,9 @@ class Job(Base):
         String(36), primary_key=True, default=lambda: str(uuid.uuid4())
     )
 
+    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
     product_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    target_audience: Mapped[str] = mapped_column(Text, nullable=False)
     product_research: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     status: Mapped[JobStatus] = mapped_column(
@@ -38,7 +42,10 @@ class Job(Base):
     total_shots: Mapped[int] = mapped_column(Integer, default=0)
     completed_shots: Mapped[int] = mapped_column(Integer, default=0)
 
-    # Result
+    # Assets
+    product_image_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reference_image_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reference_image_type: Mapped[str | None] = mapped_column(String(20), nullable=True)  # "product" | "character" | "skin"
     final_video_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
@@ -84,12 +91,16 @@ class JobShot(Base):
     lighting: Mapped[str | None] = mapped_column(String(255), nullable=True)
     emotion: Mapped[str | None] = mapped_column(String(100), nullable=True)
     voiceover_text: Mapped[str | None] = mapped_column(Text, nullable=True)
-    
+
     image_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
     video_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
-    
-    # Generated Assets
-    scene_image_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    negative_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Generated Assets — 2 image options per shot, user selects one
+    scene_image_path: Mapped[str | None] = mapped_column(Text, nullable=True)   # option 1
+    scene_image_path_2: Mapped[str | None] = mapped_column(Text, nullable=True) # option 2
+    selected_image: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 1 or 2
+    audio_clip_path: Mapped[str | None] = mapped_column(Text, nullable=True)    # TTS .wav output
     video_clip_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     
     # Progress

@@ -26,6 +26,9 @@ class VideoSafetyFilterError(VideoGenerationError):
 class VideoRateLimitError(VideoGenerationError):
     """Raised when Veo returns 429 RESOURCE_EXHAUSTED. Retried with a longer wait."""
 
+class VideoQuotaExhaustedError(VideoGenerationError):
+    """Raised when Veo returns 429 RESOURCE_EXHAUSTED but the message indicates quota limits. Not retried."""
+
 
 class AssemblyError(VideoAdGeneratorError):
     """Raised when FFmpeg assembly fails."""

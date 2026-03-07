@@ -1,8 +1,7 @@
 from pydantic import BaseModel, Field
 
 class GenerateVideoRequest(BaseModel):
-    product_name: str = Field(..., min_length=2, description="e.g. 'Skintific MSH Niacinamide'")
-    target_audience: str = Field(..., min_length=5, description="e.g. 'Wanita 18-35 tahun, kulit kusam'")
+    product_name: str = Field(..., min_length=2, description="e.g. 'Skintific MSH Niacinamide Barrier Serum'")
 
 class GenerativeVideoResponse(BaseModel):
     job_id: str

@@ -1,6 +1,5 @@
 import os
 from tenacity import RetryError
-from arq import ArqRedis
 from arq.connections import RedisSettings
 from app.core.config import get_settings
 from app.core.database import AsyncSessionFactory
@@ -15,11 +14,14 @@ from app.services.job_service import (
     update_job_status,
     complete_job,
     fail_job,
+    reject_job,
     get_job,
     create_job_shots,
     update_job_shot_image,
     update_job_shot_video,
+    get_selected_shots,
 )
+
 
 async def _check_cancellation(db, job_id: str) -> bool:
     job = await get_job(db, job_id)
@@ -28,19 +30,23 @@ async def _check_cancellation(db, job_id: str) -> bool:
         return True
     return False
 
-async def generate_video_task(
+
+# ── Task 1: Research + Director + Image Generation ────────────────────────────
+
+async def generate_images_task(
     ctx: dict,
     job_id: str,
     product_name: str,
-    target_audience: str,
-    character_image_bytes: bytes,
     product_image_bytes: bytes,
+    reference_image_bytes: bytes = b"",
+    reference_image_type: str = "",
 ) -> None:
     """
-    ARQ background task — runs the full LangGraph pipeline.
-    Updates job status in DB at each stage.
+    ARQ Task 1 — Runs research, director, and generates 2 image options per shot.
+    Ends with status AWAITING_SELECTION — waits for user to select images via API
+    before Task 2 (generate_videos_task) is triggered.
     """
-    logger.info(f"🚀 Pipeline Initiated [Job: {job_id}]")
+    logger.info(f"🚀 Task 1 Started [Job: {job_id}]")
 
     async with AsyncSessionFactory() as db:
         try:
@@ -48,26 +54,33 @@ async def generate_video_task(
             await update_job_status(
                 db, job_id,
                 status=JobStatus.RESEARCHING,
-                progress_message="Researching product info...",
+                progress_message="Researching product...",
             )
             await db.commit()
 
             initial_state = GraphState(
                 job_id=job_id,
                 product_name=product_name,
-                target_audience=target_audience,
-                character_image_bytes=character_image_bytes,
                 product_image_bytes=product_image_bytes,
+                reference_image_bytes=reference_image_bytes,
+                reference_image_type=reference_image_type,
             )
 
             if await _check_cancellation(db, job_id): return
             after_research = await research_node(initial_state)
             state = initial_state.model_copy(update=after_research)
-            
+
             job = await get_job(db, job_id)
             if job:
                 job.product_research = state.product_research
                 await db.commit()
+
+            # ── Verdict Check ─────────────────────────────────────────────
+            if state.product_verdict == "REJECTED":
+                logger.warning(f"🚫 Product Rejected [Job: {job_id}] -> {state.product_verdict_reason}")
+                await reject_job(db, job_id, state.product_verdict_reason)
+                await db.commit()
+                return
 
             # ── Stage 2: Director ─────────────────────────────────────────
             await update_job_status(
@@ -91,17 +104,71 @@ async def generate_video_task(
             await create_job_shots(db, job_id, state.storyboard)
             await db.commit()
 
-            # ── Stage 3: Shot Generation ──────────────────────────────────
+            # ── Stage 3: Image Generation (2 images per shot) ─────────────
             await update_job_status(
                 db, job_id,
-                status=JobStatus.GENERATING,
-                progress_message="Generating shots...",
+                status=JobStatus.GENERATING_IMAGES,
+                progress_message="Generating image options...",
             )
             await db.commit()
 
-            state = await _run_shot_loop_with_progress(db, job_id, state, total_shots)
+            if await _check_cancellation(db, job_id): return
+            await _run_image_generation_with_progress(db, job_id, state, total_shots)
 
-            # ── Stage 4: Assembly ─────────────────────────────────────────
+            # ── Awaiting Selection ────────────────────────────────────────
+            await update_job_status(
+                db, job_id,
+                status=JobStatus.AWAITING_SELECTION,
+                progress_message="Images ready. Select your preferred image for each shot.",
+            )
+            await db.commit()
+            logger.info(f"⏸️ Task 1 Complete — Awaiting user selection [Job: {job_id}]")
+
+        except VideoAdGeneratorError as e:
+            logger.error(f"❌ Task 1 Failed [Job: {job_id}] -> {str(e)}")
+            await fail_job(db, job_id, str(e))
+            await db.commit()
+
+        except RetryError as e:
+            cause = str(e.last_attempt.exception()) if e.last_attempt else str(e)
+            logger.error(f"❌ Task 1 Failed after retries [Job: {job_id}] -> {cause}")
+            await fail_job(db, job_id, cause)
+            await db.commit()
+
+        except Exception as e:
+            logger.error(f"💥 Task 1 Unexpected Crash [Job: {job_id}] -> {str(e)}")
+            await fail_job(db, job_id, f"Unexpected error: {e}")
+            await db.commit()
+
+
+# ── Task 2: Video Generation + Assembly ───────────────────────────────────────
+
+async def generate_videos_task(
+    ctx: dict,
+    job_id: str,
+) -> None:
+    """
+    ARQ Task 2 — Triggered by POST /api/jobs/{job_id}/approve after user selects images.
+    Generates video clips only for selected shots, then assembles the final video.
+    """
+    logger.info(f"🎬 Task 2 Started [Job: {job_id}]")
+
+    async with AsyncSessionFactory() as db:
+        try:
+            await update_job_status(
+                db, job_id,
+                status=JobStatus.GENERATING_VIDEOS,
+                progress_message="Generating video clips for selected shots...",
+            )
+            await db.commit()
+
+            if await _check_cancellation(db, job_id): return
+            generated_video_paths = await _run_video_generation_with_progress(db, job_id)
+
+            if not generated_video_paths:
+                raise VideoAdGeneratorError("No video clips were generated — no shots had a valid selection.")
+
+            # ── Assembly ──────────────────────────────────────────────────
             await update_job_status(
                 db, job_id,
                 status=JobStatus.ASSEMBLING,
@@ -110,149 +177,266 @@ async def generate_video_task(
             await db.commit()
 
             if await _check_cancellation(db, job_id): return
-            after_assembly = assembly_node(state)
-            state = state.model_copy(update=after_assembly)
 
-            # ── Done ──────────────────────────────────────────────────────
-            await complete_job(db, job_id, state.final_video_path)
+            # Reconstruct minimal state for assembly node
+            settings = get_settings()
+            assembly_state = GraphState(
+                job_id=job_id,
+                generated_video_paths=generated_video_paths,
+            )
+            after_assembly = assembly_node(assembly_state)
+            final_video_path = str(after_assembly.get("final_video_path", ""))
+
+            await complete_job(db, job_id, final_video_path)
             await db.commit()
-
-            logger.info(f"✅ Pipeline Completed [Job: {job_id}] -> Output: {state.final_video_path}")
+            logger.info(f"✅ Task 2 Complete [Job: {job_id}] -> {final_video_path}")
 
         except VideoAdGeneratorError as e:
-            logger.error(f"❌ Pipeline Failed [Job: {job_id}] -> Error: {str(e)}")
+            logger.error(f"❌ Task 2 Failed [Job: {job_id}] -> {str(e)}")
             await fail_job(db, job_id, str(e))
             await db.commit()
 
         except RetryError as e:
             cause = str(e.last_attempt.exception()) if e.last_attempt else str(e)
-            logger.error(f"❌ Pipeline Failed after retries [Job: {job_id}] -> Error: {cause}")
+            logger.error(f"❌ Task 2 Failed after retries [Job: {job_id}] -> {cause}")
             await fail_job(db, job_id, cause)
             await db.commit()
 
         except Exception as e:
-            logger.error(f"💥 Unexpected Pipeline Crash [Job: {job_id}] -> Error: {str(e)}")
+            logger.error(f"💥 Task 2 Unexpected Crash [Job: {job_id}] -> {str(e)}")
             await fail_job(db, job_id, f"Unexpected error: {e}")
             await db.commit()
 
 
-async def _run_shot_loop_with_progress(
+# ── Internal: Image Generation Phase ─────────────────────────────────────────
+
+async def _run_image_generation_with_progress(
     db,
     job_id: str,
     state: GraphState,
     total_shots: int,
-) -> GraphState:
+) -> None:
     """
-    Run shot generation shot-by-shot so we can update DB progress per shot.
-    Mirrors the logic in shot_loop_node but adds DB progress hooks.
+    Generate 2 scene images per shot and save both paths to DB.
     """
     from google import genai
-    from app.core.config import get_settings
-    from app.core.exceptions import VideoSafetyFilterError
-    from app.graph.nodes.shot_loop import _generate_scene_image, _generate_video_clip, _rewrite_blocked_shot
+    from app.graph.nodes.shot_loop import _generate_scene_image
 
     settings = get_settings()
     client = genai.Client(api_key=settings.GOOGLE_API_KEY)
     output_dir = os.path.join(settings.OUTPUT_DIR, job_id)
     os.makedirs(output_dir, exist_ok=True)
 
-    # Phase 1: Generate all scene images
-    scene_images: list[bytes] = []
     for i, shot in enumerate(state.storyboard, start=1):
         if await _check_cancellation(db, job_id):
-            return state
+            return
 
         await update_job_status(
             db, job_id,
-            status=JobStatus.GENERATING,
-            progress_message=f"Generating scene image {i}/{total_shots}...",
+            status=JobStatus.GENERATING_IMAGES,
+            completed_shots=i - 1,
+            progress_message=f"Generating images for shot {i}/{total_shots}...",
         )
         await db.commit()
 
-        scene_image = await _generate_scene_image(
+        # Image option 1
+        image_1 = await _generate_scene_image(
             client=client,
             shot=shot,
-            character_bytes=state.character_image_bytes,
             product_bytes=state.product_image_bytes,
+            reference_bytes=state.reference_image_bytes,
+            reference_type=state.reference_image_type,
         )
-        scene_images.append(scene_image)
-
-        img_path = os.path.join(output_dir, f"scene_{shot['id']:02d}.png")
-        with open(img_path, "wb") as f:
-            f.write(scene_image)
-            
-        await update_job_shot_image(db, job_id, shot_index=i, image_path=img_path)
+        img_path_1 = os.path.join(output_dir, f"scene_{shot['id']:02d}_a.png")
+        with open(img_path_1, "wb") as f:
+            f.write(image_1)
+        await update_job_shot_image(db, job_id, shot_index=i, image_path=img_path_1, image_number=1)
         await db.commit()
 
-    # Phase 2: Generate video clips with start+end frame pairs
-    generated_video_paths: list[str] = []
-    for i, (shot, scene_image) in enumerate(zip(state.storyboard, scene_images)):
-        if await _check_cancellation(db, job_id):
-            return state.model_copy(update={"generated_video_paths": generated_video_paths})
+        # Image option 2
+        image_2 = await _generate_scene_image(
+            client=client,
+            shot=shot,
+            product_bytes=state.product_image_bytes,
+            reference_bytes=state.reference_image_bytes,
+            reference_type=state.reference_image_type,
+        )
+        img_path_2 = os.path.join(output_dir, f"scene_{shot['id']:02d}_b.png")
+        with open(img_path_2, "wb") as f:
+            f.write(image_2)
+        await update_job_shot_image(db, job_id, shot_index=i, image_path=img_path_2, image_number=2)
+        await db.commit()
 
-        end_frame = scene_images[i + 1] if i + 1 < len(scene_images) else None
+        # Mark this shot as completed for progress tracking
         await update_job_status(
             db, job_id,
-            status=JobStatus.GENERATING,
+            status=JobStatus.GENERATING_IMAGES,
             completed_shots=i,
-            progress_message=f"Generating video clip {i + 1}/{total_shots}: {shot['type']}...",
         )
         await db.commit()
+
+        logger.info(f"📸 Shot {i}/{total_shots} — both images saved [Job: {job_id}]")
+
+
+# ── Internal: Video Generation Phase ─────────────────────────────────────────
+
+async def _run_video_generation_with_progress(
+    db,
+    job_id: str,
+) -> list[str]:
+    """
+    For each shot that the user selected an image for:
+    - Load the selected image from filesystem
+    - Generate a video clip (with next shot's image as end frame)
+    - Save clip path to DB
+    Returns list of generated video clip paths in shot order.
+    """
+    from google import genai
+    from app.core.exceptions import VideoSafetyFilterError
+    from app.graph.nodes.shot_loop import _generate_video_clip, _generate_tts_audio, _rewrite_blocked_shot
+    from app.graph.nodes.assembly import _merge_video_audio
+
+    settings = get_settings()
+    client = genai.Client(api_key=settings.GOOGLE_API_KEY)
+    output_dir = os.path.join(settings.OUTPUT_DIR, job_id)
+    os.makedirs(output_dir, exist_ok=True)
+
+    selected_shots = await get_selected_shots(db, job_id)
+    total = len(selected_shots)
+    logger.info(f"🎬 Video generation starting — {total} selected shots [Job: {job_id}]")
+
+    # Pre-load all selected images for end-frame pairing
+    scene_images: list[bytes] = []
+    for shot in selected_shots:
+        img_path = shot.scene_image_path if shot.selected_image == 1 else shot.scene_image_path_2
+        with open(img_path, "rb") as f:  # type: ignore[arg-type]
+            scene_images.append(f.read())
+
+    generated_video_paths: list[str] = []
+
+    for i, (shot, scene_image) in enumerate(zip(selected_shots, scene_images)):
+        if await _check_cancellation(db, job_id):
+            return generated_video_paths
+
+        end_frame = scene_images[i + 1] if i + 1 < len(scene_images) else None
+
+        await update_job_status(
+            db, job_id,
+            status=JobStatus.GENERATING_VIDEOS,
+            completed_shots=i,
+            progress_message=f"Generating video clip {i + 1}/{total}: {shot.shot_type}...",
+        )
+        await db.commit()
+
+        # Build shot dict for video generation (uses stored prompts from DB)
+        shot_dict: dict[str, object] = {
+            "id": shot.shot_index,
+            "type": shot.shot_type,
+            "subject_action": shot.subject_action or "",
+            "emotion": shot.emotion or "",
+            "video_prompt": shot.video_prompt or "",
+            "negative_prompt": shot.negative_prompt or "",
+        }
 
         try:
             video_path = await _generate_video_clip(
                 client=client,
-                shot=shot,
+                shot=shot_dict,
                 scene_image_bytes=scene_image,
                 end_frame_bytes=end_frame,
                 output_dir=output_dir,
             )
         except VideoSafetyFilterError:
-            logger.warning(f"🛡️ Shot {shot['type']} blocked by safety filter — rewriting prompt and retrying...")
+            logger.warning(f"\U0001f6e1\ufe0f Shot {shot.shot_index} blocked by safety filter — rewriting prompt...")
             await update_job_status(
                 db, job_id,
-                status=JobStatus.GENERATING,
+                status=JobStatus.GENERATING_VIDEOS,
                 progress_message=f"Shot {i + 1} blocked — rewriting prompt...",
             )
             await db.commit()
-            rewritten_shot = await _rewrite_blocked_shot(shot)
+            rewritten = await _rewrite_blocked_shot(shot_dict)
             try:
                 video_path = await _generate_video_clip(
                     client=client,
-                    shot=rewritten_shot,
+                    shot=rewritten,
                     scene_image_bytes=scene_image,
                     end_frame_bytes=end_frame,
                     output_dir=output_dir,
                 )
-            except VideoSafetyFilterError:
-                logger.error(f"🚫 Shot {i + 1} skipped — still blocked after rewrite. Continuing...")
+            except (VideoSafetyFilterError, RetryError):
+                logger.error(f"🚫 Shot {shot.shot_index} skipped — still blocked after rewrite.")
                 await update_job_status(
                     db, job_id,
-                    status=JobStatus.GENERATING,
-                    progress_message=f"Shot {i + 1} skipped (safety filter). Continuing...",
+                    status=JobStatus.GENERATING_VIDEOS,
+                    progress_message=f"Shot {i + 1} skipped (safety filter).",
                 )
                 await db.commit()
                 continue
+        except RetryError as e:
+            # Rate limit hit — all retries exhausted. Skip this shot, keep going.
+            cause = str(e.last_attempt.exception()) if e.last_attempt else str(e)
+            logger.error(
+                f"\u23f3 Shot {shot.shot_index} skipped — rate limit exhausted after retries. "
+                f"Reason: {cause}"
+            )
+            await update_job_status(
+                db, job_id,
+                status=JobStatus.GENERATING_VIDEOS,
+                progress_message=f"Shot {i + 1} skipped (rate limit). Continuing...",
+            )
+            await db.commit()
+            continue
+
+        # ── TTS Voiceover + Merge ──────────────────────────────────────
+        voiceover_text: str = shot.voiceover_text or ""
+        if voiceover_text.strip():
+            tts_path = os.path.join(output_dir, f"tts_shot_{shot.shot_index:02d}.wav")
+            try:
+                await update_job_status(
+                    db, job_id,
+                    status=JobStatus.GENERATING_VIDEOS,
+                    progress_message=f"Generating voiceover for shot {i + 1}/{total}...",
+                )
+                await db.commit()
+                await _generate_tts_audio(
+                    client=client,
+                    voiceover_text=voiceover_text,
+                    output_path=tts_path,
+                )
+                # Merge video + TTS audio into a single clip
+                merged_path = os.path.join(output_dir, f"merged_shot_{shot.shot_index:02d}.mp4")
+                merged_path = _merge_video_audio(
+                    video_path=video_path,
+                    audio_path=tts_path,
+                    output_path=merged_path,
+                )
+                video_path = merged_path
+                logger.info(f"🎧 Shot {shot.shot_index} — video + TTS merged [Job: {job_id}]")
+            except Exception as tts_err:
+                logger.warning(
+                    f"⚠️ TTS/merge failed for shot {shot.shot_index} — using video-only fallback. "
+                    f"Error: {tts_err}"
+                )
+        else:
+            logger.warning(f"⚠️ Shot {shot.shot_index} has no voiceover_text — skipping TTS.")
+
         generated_video_paths.append(video_path)
-        
-        await update_job_shot_video(db, job_id, shot_index=i + 1, video_path=video_path)
+        await update_job_shot_video(db, job_id, shot_index=shot.shot_index, video_path=video_path)
         await db.commit()
 
-    await update_job_status(db, job_id, status=JobStatus.GENERATING, completed_shots=total_shots)
+    await update_job_status(db, job_id, status=JobStatus.GENERATING_VIDEOS, completed_shots=total)
     await db.commit()
 
-    return state.model_copy(update={"generated_video_paths": generated_video_paths})
+    return generated_video_paths
 
 
 # ── ARQ Worker Settings ────────────────────────────────────────────────────────
 
 class WorkerSettings:
-    """ARQ worker configuration — pointed at by `arq src.workers.video_worker.WorkerSettings`."""
-
-    functions = [generate_video_task]
-    max_jobs = 3                # max concurrent video generation jobs
-    job_timeout = 7200          # 2 hours max per job (Veo can be slow)
-    max_tries = 1               # MUST NOT retry automatically on failure (too expensive!)
-    keep_result = 3600          # keep result in Redis for 1 hour
+    functions = [generate_images_task, generate_videos_task]
+    max_jobs = 3
+    job_timeout = 7200
+    max_tries = 1
+    keep_result = 3600
 
     redis_settings = RedisSettings.from_dsn(get_settings().REDIS_URL)

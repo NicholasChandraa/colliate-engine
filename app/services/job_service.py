@@ -6,18 +6,48 @@ from app.models.job import Job, JobStatus, JobShot, JobShotStatus
 from app.core.logging import logger
 import traceback
 
+async def get_user_jobs(
+    db: AsyncSession,
+    user_id: str,
+    limit: int = 20,
+) -> list[Job]:
+    """Return a user's jobs ordered by creation time (newest first)."""
+    try:
+        result = await db.execute(
+            select(Job)
+            .where(Job.user_id == user_id)
+            .options(selectinload(Job.shots))
+            .order_by(Job.created_at.desc())
+            .limit(limit)
+        )
+        return list(result.scalars().all())
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch jobs for user {user_id} | Error: {e}")
+        raise
+
+
 async def create_job(
     db: AsyncSession,
     job_id: str,
     product_name: str,
-    target_audience: str,
+    user_id: str | None = None,
+    product_image_path: str | None = None,
+    reference_image_path: str | None = None,
+    reference_image_type: str | None = None,
+    title: str | None = None,
 ) -> Job:
     logger.debug(f"🗄️ Preparing DB record for new Job [{job_id}]...")
     try:
+        final_title = title if title and title.strip() else product_name
+
         job = Job(
             id=job_id,
+            title=final_title,
             product_name=product_name,
-            target_audience=target_audience,
+            user_id=user_id,
+            product_image_path=product_image_path,
+            reference_image_path=reference_image_path,
+            reference_image_type=reference_image_type,
             status=JobStatus.PENDING
         )
 
@@ -97,6 +127,27 @@ async def complete_job(
         raise
 
 
+async def reject_job(
+    db: AsyncSession,
+    job_id: str,
+    reason: str,
+) -> None:
+    try:
+        job = await get_job(db, job_id)
+        if not job:
+            logger.warning(f"⚠️ Could not reject DB record: Job not found [Job: {job_id}]")
+            return
+
+        job.status = JobStatus.REJECTED
+        job.error_message = reason
+        job.updated_at = datetime.now(timezone.utc)
+        await db.flush()
+        logger.warning(f"🚫 DB Status Rejected [Job: {job_id}] | Reason: {reason}")
+    except Exception as e:
+        logger.error(f"❌ Failed to write rejected state to DB [Job: {job_id}] | Error: {e}\n{traceback.format_exc()}")
+        raise
+
+
 async def fail_job(
     db: AsyncSession,
     job_id: str,
@@ -138,11 +189,12 @@ async def create_job_shots(
                 voiceover_text=str(shot_data.get("voiceover_text")) if shot_data.get("voiceover_text") else None,
                 image_prompt=str(shot_data.get("image_prompt")) if shot_data.get("image_prompt") else None,
                 video_prompt=str(shot_data.get("video_prompt")) if shot_data.get("video_prompt") else None,
+                negative_prompt=str(shot_data.get("negative_prompt")) if shot_data.get("negative_prompt") else None,
                 status=JobShotStatus.PENDING
             )
             shots.append(shot)
             db.add(shot)
-            
+
         await db.flush()
         logger.info(f"💾 Inserted {len(shots)} JobShots into DB [Job: {job_id}]")
     except Exception as e:
@@ -166,16 +218,53 @@ async def update_job_shot_image(
     job_id: str,
     shot_index: int,
     image_path: str,
+    image_number: int = 1,  # 1 or 2
 ) -> None:
     try:
         shot = await get_job_shot(db, job_id, shot_index)
         if shot:
-            shot.scene_image_path = image_path
-            shot.status = JobShotStatus.GENERATING
+            if image_number == 1:
+                shot.scene_image_path = image_path
+            else:
+                shot.scene_image_path_2 = image_path
             shot.updated_at = datetime.now(timezone.utc)
             await db.flush()
     except Exception as e:
-        logger.error(f"❌ Failed to update image path for shot {shot_index} [Job: {job_id}] | Error: {e}")
+        logger.error(f"❌ Failed to update image {image_number} path for shot {shot_index} [Job: {job_id}] | Error: {e}")
+        raise
+
+
+async def select_shot_image(
+    db: AsyncSession,
+    job_id: str,
+    shot_index: int,
+    selection: int,  # 1 or 2
+) -> JobShot | None:
+    try:
+        shot = await get_job_shot(db, job_id, shot_index)
+        if not shot:
+            return None
+        shot.selected_image = selection
+        shot.updated_at = datetime.now(timezone.utc)
+        await db.flush()
+        logger.info(f"✅ Shot {shot_index} image {selection} selected [Job: {job_id}]")
+        return shot
+    except Exception as e:
+        logger.error(f"❌ Failed to select image for shot {shot_index} [Job: {job_id}] | Error: {e}")
+        raise
+
+
+async def get_selected_shots(db: AsyncSession, job_id: str) -> list[JobShot]:
+    """Return shots that have been selected by the user, ordered by shot_index."""
+    try:
+        result = await db.execute(
+            select(JobShot)
+            .where(JobShot.job_id == job_id, JobShot.selected_image.is_not(None))
+            .order_by(JobShot.shot_index)
+        )
+        return list(result.scalars().all())
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch selected shots [Job: {job_id}] | Error: {e}")
         raise
 
 

@@ -36,8 +36,15 @@ class Settings(BaseSettings):
     # Image generation
     IMAGE_GEN_SIZE: str = "1K"  # accepted: 512px | 1K | 2K | 4K (uppercase K required)
 
+    # TTS
+    TTS_MODEL: str = "gemini-2.5-flash-preview-tts"
+    TTS_VOICE_NAME: str = "Despina"  # female voice, warm & expressive
+
     # Output
     OUTPUT_DIR: str = "./tmp/outputs"
+
+    # Auth — shared secret with auth-service (must match JWT_SECRET_KEY there)
+    JWT_SECRET_KEY: str = "your-super-secret-key-change-in-production"
 
     # App
     APP_ENV: str = "development"

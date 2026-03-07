@@ -1,12 +1,13 @@
 import asyncio
 import os
 import uuid
+import wave
 from google import genai
 from google.genai import types
-from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, retry_if_exception
 from typing import Any, cast
 from app.core.config import get_settings
-from app.core.exceptions import ImageGenerationError, VideoGenerationError, VideoRateLimitError, VideoSafetyFilterError
+from app.core.exceptions import ImageGenerationError, VideoGenerationError, VideoRateLimitError, VideoSafetyFilterError, VideoQuotaExhaustedError
 from app.core.logging import logger
 from app.graph.state import GraphState
 
@@ -15,36 +16,74 @@ def _build_client() -> genai.Client:
     return genai.Client(api_key=settings.GOOGLE_API_KEY)
 
 IMAGE_GEN_PROMPT_WITH_PRODUCT = """
-Create a single photorealistic scene image for a product advertisement:
+Create a skincare product shot for a science-based educational video:
 
-Scene description: {image_prompt}
+Scene composition: {image_prompt}
 
-Rules:
-- The character from the FIRST reference image MUST appear in this scene exactly as they look
-- The product from the SECOND reference image MUST be clearly visible in the scene
-- Professional photography quality
-- Cinematic lighting consistent with the scene description
-- No text, no watermarks
+CRITICAL — Product fidelity rules:
+- Use the EXACT product from the reference image. Do NOT change anything about the product:
+  bottle shape, label design, label text, brand name, color, cap color, cap shape, or any detail.
+- The reference product must appear identical — treat it as a hero product shot.
+- Only change: background, lighting, props around the product, composition.
+- Style: clean studio product photography, professional editorial skincare aesthetic.
+- NO human faces, NO realistic human figures.
+- No added text, no watermarks.
 """
 
 IMAGE_GEN_PROMPT_NO_PRODUCT = """
-Create a single photorealistic scene image for a product advertisement:
+Create a photorealistic macro/ingredient/formula photograph for a premium skincare brand video.
 
 Scene description: {image_prompt}
 
-Rules:
-- The character from the reference image MUST appear in this scene exactly as they look
-- Focus entirely on the character, their emotion, and the environment — no product needed
-- Professional photography quality
-- Cinematic lighting consistent with the scene description
-- No text, no watermarks
+Mandatory visual style — photorealistic commercial beauty photography:
+- Style reference: Dior ingredient campaign, Lancôme serum commercial, Vogue Beauty editorial.
+  Every shot must look like it was captured by a professional commercial photographer.
+- NO scientific diagrams, NO stylized 3D illustrations, NO cartoon renders.
+- NO human faces, NO realistic human figures, NO product packaging.
+- No text, no watermarks, no labels.
+
+Photography guidelines per scene type:
+- Skin texture shots: DSLR macro lens, extreme close-up of skin surface only (no face),
+  dramatic side lighting to emphasize texture detail, very shallow depth of field.
+- Ingredient nature shots: food/nature editorial macro, fresh and vivid, backlight or soft
+  studio light, like a high-end botanical illustration brought to life photographically.
+- Extracted ingredient shots: clinical studio lighting, clean dark or white background,
+  crystals/powder/liquid on a pristine surface, spotlight from above.
+- Formula/serum shots: ultra-close macro of liquid texture, droplets, gel consistency,
+  ASMR-quality detail, soft diffused light, transparent or glass surface preferred.
+- Healthy skin shots: warm flattering light, smooth skin surface macro (no face),
+  slight dewy glow, shallow depth of field, looks healthy and luminous.
 """
 
+
+_REFERENCE_HINTS: dict[str, str] = {
+    "product": (
+        "\n\nADDITIONAL PRODUCT REFERENCE: A second reference image of the same product from a different angle "
+        "is provided. Use both product images for accurate product representation — same label, branding, "
+        "shape, and color must be consistent."
+    ),
+    "character": (
+        "\n\nCHARACTER REFERENCE: A reference image of the model/character is provided. "
+        "Use it for any human figure in this scene — maintain exact facial features, "
+        "skin tone, hair color, and overall appearance for consistency across shots."
+    ),
+    "skin": (
+        "\n\nSKIN REFERENCE: A reference skin texture/condition image is provided. "
+        "Use it as visual reference for the skin appearance, texture, and tone in relevant shots. "
+        "Match the skin quality and characteristics shown in the reference."
+    ),
+}
+
+
+def _should_retry_image(e: BaseException) -> bool:
+    if isinstance(e, VideoQuotaExhaustedError):
+        return False
+    return True
 
 @retry(
     stop=stop_after_attempt(2),
     wait=wait_exponential(multiplier=1, min=4, max=10),
-    retry=retry_if_exception_type(Exception),
+    retry=retry_if_exception(_should_retry_image),
     before_sleep=lambda retry_state: logger.warning(
         f"⚠️ Image Gen Failed (Attempt {retry_state.attempt_number}). Retrying..."
     )
@@ -52,17 +91,24 @@ Rules:
 async def _generate_scene_image(
     client: genai.Client,
     shot: dict[str, object],
-    character_bytes: bytes,
     product_bytes: bytes,
+    reference_bytes: bytes = b"",
+    reference_type: str = "",
 ) -> bytes:
     settings = get_settings()
     include_product = bool(shot.get("include_product", True))
+    has_reference = len(reference_bytes) > 0
     image_prompt = cast(str, shot.get("image_prompt", ""))
 
     prompt_template = IMAGE_GEN_PROMPT_WITH_PRODUCT if include_product else IMAGE_GEN_PROMPT_NO_PRODUCT
     prompt = prompt_template.format(image_prompt=image_prompt)
 
-    contents: list[types.Part] = [types.Part.from_bytes(data=character_bytes, mime_type="image/jpeg")]
+    if has_reference and reference_type in _REFERENCE_HINTS:
+        prompt += _REFERENCE_HINTS[reference_type]
+
+    contents: list[types.Part] = []
+    if has_reference:
+        contents.append(types.Part.from_bytes(data=reference_bytes, mime_type="image/jpeg"))
     if include_product:
         contents.append(types.Part.from_bytes(data=product_bytes, mime_type="image/jpeg"))
     contents.append(types.Part.from_text(text=prompt))
@@ -73,8 +119,8 @@ async def _generate_scene_image(
             model=settings.IMAGE_GEN_MODEL,
             contents=contents,
             config=types.GenerateContentConfig(
-                response_modalities=["TEXT", "IMAGE"],
-                image_config=types.ImageConfig(
+                response_modalities=["TEXT", "IMAGE"],  # type: ignore[call-arg]
+                image_config=types.ImageConfig(  # type: ignore[call-arg]
                     aspect_ratio=cast(str, settings.VIDEO_ASPECT_RATIO),
                     image_size=cast(str, settings.IMAGE_GEN_SIZE),
                 ),
@@ -90,7 +136,11 @@ async def _generate_scene_image(
     except ImageGenerationError:
         raise
     except Exception as e:
-        logger.error(f"❌ Image Model Failed [Shot {shot['id']}] -> Error: {str(e)}")
+        error_str = str(e)
+        logger.error(f"❌ Image Model Failed [Shot {shot['id']}] -> Error: {error_str}")
+        if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+            if "exceeded your current quota" in error_str.lower():
+                raise VideoQuotaExhaustedError(f"Shot {shot['id']}: Gemini API Quota Exhausted. Check billing.") from e
         raise ImageGenerationError(f"Shot {shot['id']}: image gen failed: {e}") from e
 
 
@@ -103,10 +153,15 @@ def _video_retry_wait(retry_state: object) -> float:
     attempt = retry_state.attempt_number  # type: ignore[union-attr]
     return min(4.0 * (2 ** (attempt - 1)), 10.0)
 
+def _should_retry_video(e: BaseException) -> bool:
+    if isinstance(e, (VideoSafetyFilterError, VideoQuotaExhaustedError)):
+        return False
+    return isinstance(e, VideoGenerationError)
+
 @retry(
     stop=stop_after_attempt(2),
     wait=_video_retry_wait,
-    retry=retry_if_exception_type(VideoGenerationError),  # does NOT retry VideoSafetyFilterError
+    retry=retry_if_exception(_should_retry_video),
     before_sleep=lambda retry_state: logger.warning(
         f"⚠️ Video Gen Failed (Attempt {retry_state.attempt_number}). Retrying..."
     )
@@ -182,6 +237,8 @@ async def _generate_video_clip(
         error_str = str(e)
         logger.error(f"❌ Video Model Failed [Shot {shot['id']}] -> Error: {error_str}")
         if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+            if "exceeded your current quota" in error_str.lower():
+                raise VideoQuotaExhaustedError(f"Shot {shot['id']}: Gemini API Quota Exhausted. Check billing.") from e
             raise VideoRateLimitError(f"Shot {shot['id']}: rate limit hit, will retry after delay") from e
         raise VideoGenerationError(f"Shot {shot['id']}: video gen failed: {e}") from e
 
@@ -206,6 +263,63 @@ Rules:
 - Keep all camera motion terminology and audio cues intact
 - Return ONLY valid JSON, no markdown: {{"video_prompt": "...", "negative_prompt": "..."}}"""
 
+
+async def _generate_tts_audio(
+    client: genai.Client,
+    voiceover_text: str,
+    output_path: str,
+) -> str:
+    """
+    Generate TTS voiceover from text using Gemini 2.5 Flash TTS.
+    Returns the path to the saved .wav file.
+
+    The Gemini TTS API returns raw PCM audio (24kHz, 16-bit, mono).
+    We wrap it in a proper WAVE container using Python's built-in `wave` module.
+    """
+    settings = get_settings()
+
+    try:
+        logger.info(f"🎙️ TTS Generation Started -> '{voiceover_text[:60]}...'")
+        response = await client.aio.models.generate_content(  # pyright: ignore[reportUnknownMemberType]
+            model=settings.TTS_MODEL,
+            contents=voiceover_text,
+            config=types.GenerateContentConfig(
+                response_modalities=["AUDIO"],  # type: ignore[call-arg]
+                speech_config=types.SpeechConfig(  # type: ignore[call-arg]
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name=settings.TTS_VOICE_NAME,
+                        )
+                    )
+                ),
+            ),
+        )
+
+        candidate = response.candidates[0] if response.candidates else None
+        content = candidate.content if candidate else None
+        parts = content.parts if content else None  # type: ignore[union-attr]
+        if not parts:
+            raise RuntimeError("TTS returned no audio parts")
+
+        audio_part = parts[0]
+        if not audio_part.inline_data or not audio_part.inline_data.data:
+            raise RuntimeError("TTS returned empty inline_data")
+
+        raw_pcm: bytes = cast(bytes, audio_part.inline_data.data)
+
+        # Wrap raw PCM (24kHz, 16-bit, mono) in a .wav container
+        with wave.open(output_path, "wb") as wav_file:
+            wav_file.setnchannels(1)      # mono
+            wav_file.setsampwidth(2)      # 16-bit = 2 bytes
+            wav_file.setframerate(24000)  # 24kHz — Gemini TTS default
+            wav_file.writeframes(raw_pcm)
+
+        logger.info(f"✅ TTS Audio Saved -> {output_path} ({len(raw_pcm) / 1024:.1f} KB PCM)")
+        return output_path
+
+    except Exception as e:
+        logger.error(f"❌ TTS Generation Failed -> {str(e)}")
+        raise
 
 async def _rewrite_blocked_shot(shot: dict[str, object]) -> dict[str, object]:
     """Ask LLM to rewrite a safety-filter-blocked shot prompt with safer language."""
@@ -266,7 +380,6 @@ async def shot_loop_node(state: GraphState) -> dict[str, object]:
         scene_image = await _generate_scene_image(
             client=client,
             shot=shot,
-            character_bytes=state.character_image_bytes,
             product_bytes=state.product_image_bytes,
         )
         scene_images.append(scene_image)

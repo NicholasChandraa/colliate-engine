@@ -34,6 +34,44 @@ def _concatenate_clips(clip_paths: list[str], output_path: str) -> None:
     ])
 
 
+def _merge_video_audio(video_path: str, audio_path: str, output_path: str) -> str:
+    """
+    Merge a Veo video clip with a TTS audio file into a single .mp4.
+    Mixes Veo's native audio (SFX/ambient) with the TTS voiceover.
+    """
+    try:
+        # Try to mix both audio streams (assuming Veo generated an audio track)
+        _run_ffmpeg([
+            "-i", video_path,
+            "-i", audio_path,
+            "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2[a]",
+            "-map", "0:v",
+            "-map", "[a]",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-ar", "44100",
+            "-ac", "2",
+            output_path,
+        ])
+    except AssemblyError:
+        logger.warning(f"⚠️ amix failed for {video_path}, falling back to replacing audio track")
+        # Fallback if video has no audio track: just use the TTS audio
+        _run_ffmpeg([
+            "-i", video_path,
+            "-i", audio_path,
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-ar", "44100",
+            "-ac", "2",
+            "-shortest",
+            output_path,
+        ])
+    logger.debug(f"⚙️ FFmpeg Merge Complete -> {output_path}")
+    return output_path
+
+
 def assembly_node(state: GraphState) -> dict[str, str]:
     logger.info(f"🎬 Graph Node: Final Assembly Started -> Merging {len(state.generated_video_paths)} clips")
 
