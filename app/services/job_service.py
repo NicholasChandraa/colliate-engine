@@ -88,6 +88,9 @@ async def update_job_status(
             logger.warning(f"⚠️ Could not update DB: Job not found [Job: {job_id}]")
             return
 
+        if job.status == JobStatus.CANCELLED:
+            return  # never overwrite a cancellation
+
         job.status = status
         job.updated_at = datetime.now(timezone.utc)
 
@@ -283,4 +286,38 @@ async def update_job_shot_video(
             await db.flush()
     except Exception as e:
         logger.error(f"❌ Failed to update video path for shot {shot_index} [Job: {job_id}] | Error: {e}")
+        raise
+
+
+async def update_job_shot_raw_video(
+    db: AsyncSession,
+    job_id: str,
+    shot_index: int,
+    raw_video_path: str,
+) -> None:
+    try:
+        shot = await get_job_shot(db, job_id, shot_index)
+        if shot:
+            shot.raw_video_clip_path = raw_video_path
+            shot.updated_at = datetime.now(timezone.utc)
+            await db.flush()
+    except Exception as e:
+        logger.error(f"❌ Failed to update raw video path for shot {shot_index} [Job: {job_id}] | Error: {e}")
+        raise
+
+
+async def update_job_shot_audio(
+    db: AsyncSession,
+    job_id: str,
+    shot_index: int,
+    audio_path: str,
+) -> None:
+    try:
+        shot = await get_job_shot(db, job_id, shot_index)
+        if shot:
+            shot.audio_clip_path = audio_path
+            shot.updated_at = datetime.now(timezone.utc)
+            await db.flush()
+    except Exception as e:
+        logger.error(f"❌ Failed to update audio path for shot {shot_index} [Job: {job_id}] | Error: {e}")
         raise

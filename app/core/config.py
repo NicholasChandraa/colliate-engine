@@ -1,3 +1,4 @@
+import os
 from typing import ClassVar
 from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -9,8 +10,11 @@ class Settings(BaseSettings):
         case_sensitive=False
     )
 
-    # Google API
-    GOOGLE_API_KEY: str = ""
+    # Google Vertex AI
+    VERTEX_AI_API_KEY: str = ""
+    GCP_PROJECT: str | None = None
+    GCP_LOCATION: str = "us-central1"
+    GOOGLE_APPLICATION_CREDENTIALS: str | None = None
 
     # Database
     DATABASE_URL: str = "postgresql+asyncpg://user:password@localhost:5432/video_ad_db"
@@ -25,7 +29,7 @@ class Settings(BaseSettings):
     IMAGE_GEN_MODEL: str = "gemini-3.1-flash-image-preview"
     VIDEO_GEN_MODEL: str = "veo-3.1-generate-preview"
     THINKING_LEVEL: str = "low"
-    
+
     # Video
     VIDEO_ASPECT_RATIO: str = "9:16"
     VIDEO_RESOLUTION: str = "1080p"
@@ -57,4 +61,8 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     """Singleton settings instance - call this everywhere instead of Settings()."""
-    return Settings()
+    settings = Settings()
+    # Ensure google auth can find the credentials file globally in the environment
+    if settings.GOOGLE_APPLICATION_CREDENTIALS:
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = settings.GOOGLE_APPLICATION_CREDENTIALS
+    return settings

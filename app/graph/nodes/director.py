@@ -1,24 +1,54 @@
 import asyncio
-from typing import cast
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.output_parsers import JsonOutputParser
+import json
+import re
+from google import genai
+from google.genai import types
+from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_exponential
 from app.core.config import get_settings
 from app.core.exceptions import StoryboardError
 from app.core.logging import logger
+from app.core.llm import get_genai_client
 from app.graph.state import GraphState
 from app.schemas.storyboard import Storyboard
 
 DIRECTOR_TIMEOUT_SECONDS = 180
 
+def _parse_json(text: str) -> dict:
+    text = re.sub(r"```(?:json)?\s*", "", text).replace("```", "").strip()
+    return json.loads(text)
 
-def _build_llm(model: str) -> ChatGoogleGenerativeAI:
-    settings = get_settings()
-    return ChatGoogleGenerativeAI(
-        model=model,
-        google_api_key=settings.GOOGLE_API_KEY,
-        temperature=0.5,
-        thinking_level=settings.THINKING_LEVEL,
-    )
+
+def _is_rate_limit(exc: BaseException) -> bool:
+    return "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc)
+
+
+async def _generate_with_retry(
+    client: genai.Client,
+    model: str,
+    contents: str,
+    config: types.GenerateContentConfig,
+) -> types.GenerateContentResponse:
+    async for attempt in AsyncRetrying(
+        retry=retry_if_exception(_is_rate_limit),
+        wait=wait_exponential(multiplier=2, min=5, max=30),
+        stop=stop_after_attempt(3),
+        reraise=True,
+    ):
+        with attempt:
+            attempt_num = attempt.retry_state.attempt_number
+            if attempt_num > 1:
+                logger.warning(f"⏳ Director retry attempt {attempt_num}/3 after rate limit...")
+            return await client.aio.models.generate_content(
+                model=model, contents=contents, config=config,
+            )
+    raise StoryboardError("Exhausted retries without returning a response.")
+
+
+def _make_config(settings, thinking: bool = True) -> types.GenerateContentConfig:
+    cfg: dict = {"temperature": 0.5}
+    if thinking and settings.THINKING_LEVEL != "none":
+        cfg["thinking_config"] = types.ThinkingConfig(thinking_budget=-1)
+    return types.GenerateContentConfig(**cfg)
 
 
 DIRECTOR_PROMPT = """
@@ -114,13 +144,19 @@ HARUS: "Rutin 7 langkah tapi kulit masih kusam? Itu karena urutan aplikasinya sa
 
 ## LANGUAGE & AUDIO
 Semua `video_prompt` dan `negative_prompt` WAJIB ditulis dalam bahasa Inggris.
-Struktur `video_prompt`: [Camera motion]. [Visual subject]. [Style/ambiance]. [Audio: SFX + ambient music ONLY].
+Struktur `video_prompt`: [Camera motion]. [Visual subject]. [Style/ambiance]. [Audio: diegetic SFX ONLY].
 
 Audio format untuk `video_prompt`:
-- WAJIB: Hanya SFX dan ambient music. Contoh: "Soft molecular zoom SFX, calm clinical background music."
-- DILARANG: Voiceover, dialog, Female voiceover, male voice, atau instruksi suara manusia APAPUN.
-  Voiceover akan ditambahkan terpisah via TTS — JANGAN masukkan ke video_prompt.
-- Akhiri selalu dengan: "No dialogue, no voiceover."
+- WAJIB: Hanya diegetic SFX — suara yang muncul secara natural dari objek/bahan di scene itu sendiri.
+  Contoh per tipe shot:
+  - Skin texture shot: "Subtle skin surface ASMR sound, soft micro-texture contact."
+  - Serum/formula drop: "Quiet liquid drop on glass, delicate surface ripple sound."
+  - Ingredient nature: "Faint botanical rustle, light natural ambience."
+  - Ingredient extracted: "Delicate crystalline or powder settling sound."
+  - Product placement: "Soft object placement on surface, quiet studio."
+- DILARANG: background music, ambient music, music score, soundtrack, atau suara musik apapun.
+- DILARANG: voiceover, narasi, dialog, atau suara manusia dalam bentuk apapun.
+- Akhiri selalu dengan: "No music, no dialogue, no voiceover."
 
 Field `voiceover_text` (per shot, bahasa Indonesia):
 - Narasi yang akan di-synthesize oleh TTS secara terpisah
@@ -170,7 +206,7 @@ Return ONLY valid JSON — tanpa markdown, tanpa penjelasan, tanpa teks lain:
             "include_product": false,
             "image_prompt": "string — Prompt untuk Imagen. Scientific visualization / macro / product mockup. DILARANG menyebut wajah atau tubuh manusia. Untuk shot include_product=true: HANYA deskripsikan scene composition, background, dan lighting — JANGAN sebutkan warna/label/bentuk produk. Format: static single frame.",
             "video_prompt": "string — IN ENGLISH. [Camera motion]. [Visual]. [Style]. [Audio: SFX + ambient music ONLY, NO voiceover, NO dialogue]. End: 'No dialogue, no voiceover.'",
-            "negative_prompt": "string — IN ENGLISH. realistic human faces, human body parts, text overlay, watermarks, blurry motion, distorted shapes, camera shake.",
+            "negative_prompt": "string — IN ENGLISH. realistic human faces, human body parts, text overlay, watermarks, blurry motion, distorted shapes, camera shake, background music, music score, ambient music.",
             "voiceover_text": "string — BAHASA INDONESIA. Narasi TTS 1-2 kalimat maks 30 kata. Klinis, edukatif, di-generate terpisah via Gemini TTS."
         }}
     ]
@@ -192,7 +228,7 @@ async def director_node(state: GraphState) -> dict[str, list[dict[str, object]]]
     logger.info("🎬 Graph Node: Clinical Director Started -> Generating Science Storyboard")
 
     settings = get_settings()
-    parser = JsonOutputParser()
+    client = get_genai_client()
 
     prompt = DIRECTOR_PROMPT.format(
         product_research=state.product_research,
@@ -207,9 +243,11 @@ async def director_node(state: GraphState) -> dict[str, list[dict[str, object]]]
     try:
         logger.info(f"📑 LLM PROMPT DIRECTOR: {prompt}")
         try:
-            llm = _build_llm(settings.LLM_DIRECTOR_MODEL)
-            llm_response = await asyncio.wait_for(
-                llm.ainvoke(prompt),
+            director_response = await asyncio.wait_for(
+                _generate_with_retry(
+                    client, settings.LLM_DIRECTOR_MODEL, prompt,
+                    _make_config(settings, thinking=True),
+                ),
                 timeout=DIRECTOR_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
@@ -217,19 +255,13 @@ async def director_node(state: GraphState) -> dict[str, list[dict[str, object]]]
                 f"⏱️ Director LLM timed out after {DIRECTOR_TIMEOUT_SECONDS}s "
                 f"— falling back to {settings.LLM_DIRECTOR_MODEL_FALLBACK}"
             )
-            llm = _build_llm(settings.LLM_DIRECTOR_MODEL_FALLBACK)
-            llm_response = await llm.ainvoke(prompt)
-        logger.info(f"📑 LLM DIRECTOR RESPONSE: {llm_response}")
+            director_response = await _generate_with_retry(
+                client, settings.LLM_DIRECTOR_MODEL_FALLBACK, prompt,
+                _make_config(settings, thinking=False),
+            )
+        logger.info(f"📑 LLM DIRECTOR RESPONSE: {director_response}")
 
-        content = llm_response.content
-        if isinstance(content, str):
-            json_string = content
-        elif isinstance(content, list) and content and isinstance(content[0], dict):
-            json_string = cast(str, content[0].get("text", ""))
-        else:
-            json_string = str(content)
-
-        storyboard_dict = cast(dict[str, object], parser.parse(json_string))
+        storyboard_dict = _parse_json(director_response.text or "")
         storyboard = Storyboard.model_validate(storyboard_dict)
 
         logger.info(f"✅ Clinical Director Completed -> Mastered {len(storyboard.shots)} shots.")

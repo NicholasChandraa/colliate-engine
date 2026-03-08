@@ -19,6 +19,8 @@ class JobShotSchema(BaseModel):
     scene_image_path: str | None = None
     scene_image_path_2: str | None = None
     selected_image: int | None = None
+    audio_clip_path: str | None = None
+    raw_video_clip_path: str | None = None
     video_clip_path: str | None = None
     status: JobShotStatus
     error_message: str | None = None

@@ -1,5 +1,7 @@
 import asyncio
+import json
 import os
+import re
 import uuid
 import wave
 from google import genai
@@ -9,11 +11,8 @@ from typing import Any, cast
 from app.core.config import get_settings
 from app.core.exceptions import ImageGenerationError, VideoGenerationError, VideoRateLimitError, VideoSafetyFilterError, VideoQuotaExhaustedError
 from app.core.logging import logger
+from app.core.llm import get_genai_client, get_video_genai_client
 from app.graph.state import GraphState
-
-def _build_client() -> genai.Client:
-    settings = get_settings()
-    return genai.Client(api_key=settings.GOOGLE_API_KEY)
 
 IMAGE_GEN_PROMPT_WITH_PRODUCT = """
 Create a skincare product shot for a science-based educational video:
@@ -78,11 +77,22 @@ _REFERENCE_HINTS: dict[str, str] = {
 def _should_retry_image(e: BaseException) -> bool:
     if isinstance(e, VideoQuotaExhaustedError):
         return False
+    # Always retry on image generation errors (including the 429s we catch and wrap)
     return True
 
+def _image_retry_wait(retry_state: object) -> float:
+    """Wait longer specifically for rate limit errors."""
+    exc = retry_state.outcome.exception()  # type: ignore[union-attr]
+    if isinstance(exc, ImageGenerationError) and "429" in str(exc):
+        logger.warning(f"⏳ Image Gen Rate limit hit (429) — waiting 15s before retry...")
+        return 15.0
+    # Standard exponential backoff for other errors
+    attempt = retry_state.attempt_number  # type: ignore[union-attr]
+    return min(4.0 * (2 ** (attempt - 1)), 20.0)
+
 @retry(
-    stop=stop_after_attempt(2),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
+    stop=stop_after_attempt(5),
+    wait=_image_retry_wait,
     retry=retry_if_exception(_should_retry_image),
     before_sleep=lambda retry_state: logger.warning(
         f"⚠️ Image Gen Failed (Attempt {retry_state.attempt_number}). Retrying..."
@@ -119,7 +129,7 @@ async def _generate_scene_image(
             model=settings.IMAGE_GEN_MODEL,
             contents=contents,
             config=types.GenerateContentConfig(
-                response_modalities=["TEXT", "IMAGE"],  # type: ignore[call-arg]
+                response_modalities=["IMAGE"],  # type: ignore[call-arg]
                 image_config=types.ImageConfig(  # type: ignore[call-arg]
                     aspect_ratio=cast(str, settings.VIDEO_ASPECT_RATIO),
                     image_size=cast(str, settings.IMAGE_GEN_SIZE),
@@ -127,11 +137,15 @@ async def _generate_scene_image(
             ),
         )
 
-        if not response.parts or not response.parts[0].inline_data:
-            raise ImageGenerationError(f"Shot {shot['id']}: image gen returned no data")
+        if not response.parts:
+            raise ImageGenerationError(f"Shot {shot['id']}: image gen returned no parts")
 
-        logger.info(f"📸 Image Model Generated Scene [Shot {shot['id']}]")
-        return cast(bytes, response.parts[0].inline_data.data)
+        for part in response.parts:
+            if part.inline_data and part.inline_data.data:
+                logger.info(f"📸 Image Model Generated Scene [Shot {shot['id']}]")
+                return cast(bytes, part.inline_data.data)
+
+        raise ImageGenerationError(f"Shot {shot['id']}: image gen returned no inline_data in parts")
 
     except ImageGenerationError:
         raise
@@ -155,6 +169,10 @@ def _video_retry_wait(retry_state: object) -> float:
 
 def _should_retry_video(e: BaseException) -> bool:
     if isinstance(e, (VideoSafetyFilterError, VideoQuotaExhaustedError)):
+        return False
+    error_str = str(e)
+    # Stop immediately on bad request/invalid project errors
+    if "INVALID_ARGUMENT" in error_str or "RESOURCE_PROJECT_INVALID" in error_str:
         return False
     return isinstance(e, VideoGenerationError)
 
@@ -217,16 +235,18 @@ async def _generate_video_clip(
         if not video.video:
             raise VideoGenerationError(f"Shot {shot['id']}: video gen returned no file reference")
 
-        # Veo stores video on Google servers — download() returns the raw bytes.
-        # cast(Any) needed because SDK type stubs declare str|File but Video works at runtime.
-        video_bytes = await client.aio.files.download(file=cast(Any, video.video))
+        # Vertex AI returns the video bytes directly in the response
+        if getattr(video.video, "video_bytes", None):
+            video_bytes = video.video.video_bytes
+        else:
+            raise VideoGenerationError(f"Shot {shot['id']}: downloaded video has no bytes (or only URI returned)")
 
         if not video_bytes:
             raise VideoGenerationError(f"Shot {shot['id']}: downloaded video has no bytes")
 
         video_path = os.path.join(output_dir, f"shot_{shot['id']:02d}.mp4")
         with open(video_path, "wb") as f:
-            f.write(video_bytes)
+            f.write(cast(bytes, video_bytes))
 
         logger.info(f"🎥 Video Model Completed [Shot {shot['id']}] -> Output: {video_path}")
         return video_path
@@ -323,17 +343,8 @@ async def _generate_tts_audio(
 
 async def _rewrite_blocked_shot(shot: dict[str, object]) -> dict[str, object]:
     """Ask LLM to rewrite a safety-filter-blocked shot prompt with safer language."""
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    from langchain_core.output_parsers import JsonOutputParser
-    from typing import cast as _cast
-
     settings = get_settings()
-    llm = ChatGoogleGenerativeAI(
-        model=settings.LLM_RESEARCH_MODEL,
-        google_api_key=settings.GOOGLE_API_KEY,
-        temperature=0.3,
-    )
-    parser = JsonOutputParser()
+    client = get_genai_client()
 
     prompt = REWRITE_PROMPT.format(
         type=shot.get("type", ""),
@@ -344,15 +355,15 @@ async def _rewrite_blocked_shot(shot: dict[str, object]) -> dict[str, object]:
     )
 
     logger.info(f"🔄 Rewriting blocked shot {shot['id']} prompt via LLM...")
-    response = await llm.ainvoke(prompt)
+    response = await client.aio.models.generate_content(
+        model=settings.LLM_RESEARCH_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.3),  # pyright: ignore[reportCallIssue]
+    )
 
-    content = response.content
-    if isinstance(content, list) and content and isinstance(content[0], dict):
-        json_str = _cast(str, content[0].get("text", ""))
-    else:
-        json_str = str(content)
-
-    result = _cast(dict[str, object], parser.parse(json_str))
+    raw = response.text or ""
+    raw = re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
+    result = cast(dict[str, object], json.loads(raw))
     logger.info(f"✅ Shot {shot['id']} prompt rewritten successfully.")
 
     return {
@@ -370,7 +381,8 @@ async def shot_loop_node(state: GraphState) -> dict[str, object]:
     output_dir = os.path.join(settings.OUTPUT_DIR, run_id)
     os.makedirs(output_dir, exist_ok=True)
 
-    client = _build_client()
+    client = get_genai_client()
+    video_client = get_video_genai_client()
 
     # Phase 1: Generate all scene images first
     logger.info("shot_loop_node.phase1 | generating all scene images")
@@ -387,6 +399,9 @@ async def shot_loop_node(state: GraphState) -> dict[str, object]:
         img_path = os.path.join(output_dir, f"scene_{shot['id']:02d}.png")
         with open(img_path, "wb") as f:
             f.write(scene_image)
+            
+        # Add a brief delay to prevent triggering Vertex AI rate limits (burst limit)
+        await asyncio.sleep(4)
 
     # Phase 2: Generate video clips with start+end frame pairs
     logger.info("shot_loop_node.phase2 | generating video clips")
@@ -397,7 +412,7 @@ async def shot_loop_node(state: GraphState) -> dict[str, object]:
 
         try:
             video_path = await _generate_video_clip(
-                client=client,
+                client=video_client,
                 shot=shot,
                 scene_image_bytes=scene_image,
                 end_frame_bytes=end_frame,
@@ -408,7 +423,7 @@ async def shot_loop_node(state: GraphState) -> dict[str, object]:
             rewritten_shot = await _rewrite_blocked_shot(shot)
             try:
                 video_path = await _generate_video_clip(
-                    client=client,
+                    client=video_client,
                     shot=rewritten_shot,
                     scene_image_bytes=scene_image,
                     end_frame_bytes=end_frame,

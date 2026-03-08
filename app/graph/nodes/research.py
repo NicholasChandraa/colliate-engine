@@ -1,19 +1,17 @@
-from typing import cast
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.output_parsers import JsonOutputParser
+import json
+import re
+from google import genai
+from google.genai import types
 from app.core.config import get_settings
 from app.core.exceptions import ResearchError
 from app.core.logging import logger
+from app.core.llm import get_genai_client
 from app.graph.state import GraphState
 
 
-def _build_llm() -> ChatGoogleGenerativeAI:
-    settings = get_settings()
-    return ChatGoogleGenerativeAI(
-        model=settings.LLM_RESEARCH_MODEL,
-        google_api_key=settings.GOOGLE_API_KEY,
-        temperature=0.2,
-    )
+def _parse_json(text: str) -> dict:
+    text = re.sub(r"```(?:json)?\s*", "", text).replace("```", "").strip()
+    return json.loads(text)
 
 
 RESEARCH_PROMPT = """
@@ -86,7 +84,7 @@ Return ONLY valid JSON (tanpa markdown, tanpa penjelasan tambahan):
 """
 
 
-async def research_node(state: GraphState) -> dict[str, str]:
+async def research_node(state: GraphState) -> dict[str, str | list[str]]:
     """
     LangGraph Node: Skincare Science Analyst.
 
@@ -104,30 +102,30 @@ async def research_node(state: GraphState) -> dict[str, str]:
     """
     logger.info(f"🔬 Graph Node: Skincare Science Analyst Started -> Researching '{state.product_name}'")
 
-    # ── Call 1: Google Search grounding — scientific brief ────────────────
-    llm = _build_llm().bind_tools([{"google_search": {}}])
+    settings = get_settings()
+    client = get_genai_client()
     prompt = RESEARCH_PROMPT.format(product_name=state.product_name)
 
+    # ── Call 1: Google Search grounding — scientific brief ────────────────
     try:
         logger.info(f"📑 LLM PROMPT RESEARCHER: {prompt}")
-        research_response = await llm.ainvoke(prompt)
+        research_response = await client.aio.models.generate_content(
+            model=settings.LLM_RESEARCH_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                temperature=0.2,
+            ),
+        )
         logger.info(f"📑 LLM RESEARCHER RESPONSE: {research_response}")
 
-        grounding = research_response.response_metadata.get("grounding_metadata") if research_response.response_metadata else None
-        if grounding:
-            search_queries = grounding.get("web_search_queries", [])
-            logger.info(f"🔍 Google Search Used -> Queries: {search_queries}")
+        candidate = research_response.candidates[0] if research_response.candidates else None
+        if candidate and candidate.grounding_metadata and candidate.grounding_metadata.web_search_queries:
+            logger.info(f"🔍 Google Search Used -> Queries: {candidate.grounding_metadata.web_search_queries}")
         else:
             logger.warning("⚠️ Google Search NOT used — response has no grounding_metadata")
 
-        raw = research_response.content
-        if isinstance(raw, str):
-            scientific_brief = raw
-        elif isinstance(raw, list) and raw and isinstance(raw[0], dict):
-            scientific_brief = cast(str, raw[0].get("text", ""))
-        else:
-            scientific_brief = str(raw)
-
+        scientific_brief = research_response.text or ""
         if not scientific_brief.strip():
             raise ResearchError("Research LLM returned empty content")
 
@@ -140,21 +138,17 @@ async def research_node(state: GraphState) -> dict[str, str]:
         raise ResearchError(f"Research failed: {e}") from e
 
     # ── Call 2: Verdict — no grounding needed ────────────────────────────
-    verdict_llm = _build_llm()
-    parser = JsonOutputParser()
     verdict_prompt = VERDICT_PROMPT.format(product_research=scientific_brief)
 
     try:
         logger.info("⚖️ Running product verdict evaluation...")
-        verdict_response = await verdict_llm.ainvoke(verdict_prompt)
+        verdict_response = await client.aio.models.generate_content(
+            model=settings.LLM_RESEARCH_MODEL,
+            contents=verdict_prompt,
+            config=types.GenerateContentConfig(temperature=0.2),
+        )
 
-        verdict_raw = verdict_response.content
-        if isinstance(verdict_raw, list) and verdict_raw and isinstance(verdict_raw[0], dict):
-            verdict_str = cast(str, verdict_raw[0].get("text", ""))
-        else:
-            verdict_str = str(verdict_raw)
-
-        verdict_data = cast(dict[str, object], parser.parse(verdict_str))
+        verdict_data = _parse_json(verdict_response.text or "")
         verdict = str(verdict_data.get("verdict", "REJECTED")).upper()
         reason = str(verdict_data.get("reason", "Tidak ada alasan diberikan."))
         formula_color = str(verdict_data.get("formula_color", "translucent"))
@@ -183,3 +177,4 @@ async def research_node(state: GraphState) -> dict[str, str]:
     except Exception as e:
         logger.error(f"❌ Verdict Call Failed -> Error: {str(e)}")
         raise ResearchError(f"Verdict evaluation failed: {e}") from e
+

@@ -100,8 +100,9 @@ class JobShot(Base):
     scene_image_path: Mapped[str | None] = mapped_column(Text, nullable=True)   # option 1
     scene_image_path_2: Mapped[str | None] = mapped_column(Text, nullable=True) # option 2
     selected_image: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 1 or 2
-    audio_clip_path: Mapped[str | None] = mapped_column(Text, nullable=True)    # TTS .wav output
-    video_clip_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    audio_clip_path: Mapped[str | None] = mapped_column(Text, nullable=True)       # TTS .wav
+    raw_video_clip_path: Mapped[str | None] = mapped_column(Text, nullable=True)  # Veo raw output
+    video_clip_path: Mapped[str | None] = mapped_column(Text, nullable=True)      # Veo + TTS merged
     
     # Progress
     status: Mapped[JobShotStatus] = mapped_column(Enum(JobShotStatus), nullable=False, default=JobShotStatus.PENDING)

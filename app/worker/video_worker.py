@@ -19,6 +19,8 @@ from app.services.job_service import (
     create_job_shots,
     update_job_shot_image,
     update_job_shot_video,
+    update_job_shot_raw_video,
+    update_job_shot_audio,
     get_selected_shots,
 )
 
@@ -38,8 +40,8 @@ async def generate_images_task(
     job_id: str,
     product_name: str,
     product_image_bytes: bytes,
-    reference_image_bytes: bytes = b"",
-    reference_image_type: str = "",
+    reference_image_bytes: bytes | None = None,
+    reference_image_type: str | None = None,
 ) -> None:
     """
     ARQ Task 1 — Runs research, director, and generates 2 image options per shot.
@@ -61,9 +63,9 @@ async def generate_images_task(
             initial_state = GraphState(
                 job_id=job_id,
                 product_name=product_name,
-                product_image_bytes=product_image_bytes,
-                reference_image_bytes=reference_image_bytes,
-                reference_image_type=reference_image_type,
+                product_image_bytes=product_image_bytes or b"",
+                reference_image_bytes=reference_image_bytes or b"",
+                reference_image_type=reference_image_type or "",
             )
 
             if await _check_cancellation(db, job_id): return
@@ -223,7 +225,10 @@ async def _run_image_generation_with_progress(
     from app.graph.nodes.shot_loop import _generate_scene_image
 
     settings = get_settings()
-    client = genai.Client(api_key=settings.GOOGLE_API_KEY)
+    client = genai.Client(
+        vertexai=True,
+        api_key=settings.VERTEX_AI_API_KEY,
+    )
     output_dir = os.path.join(settings.OUTPUT_DIR, job_id)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -291,13 +296,14 @@ async def _run_video_generation_with_progress(
     - Save clip path to DB
     Returns list of generated video clip paths in shot order.
     """
-    from google import genai
     from app.core.exceptions import VideoSafetyFilterError
     from app.graph.nodes.shot_loop import _generate_video_clip, _generate_tts_audio, _rewrite_blocked_shot
     from app.graph.nodes.assembly import _merge_video_audio
+    from app.core.llm import get_genai_client, get_video_genai_client
 
     settings = get_settings()
-    client = genai.Client(api_key=settings.GOOGLE_API_KEY)
+    client = get_genai_client()
+    video_client = get_video_genai_client()
     output_dir = os.path.join(settings.OUTPUT_DIR, job_id)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -338,9 +344,12 @@ async def _run_video_generation_with_progress(
             "negative_prompt": shot.negative_prompt or "",
         }
 
+        if await _check_cancellation(db, job_id):
+            return generated_video_paths
+
         try:
             video_path = await _generate_video_clip(
-                client=client,
+                client=video_client,
                 shot=shot_dict,
                 scene_image_bytes=scene_image,
                 end_frame_bytes=end_frame,
@@ -357,7 +366,7 @@ async def _run_video_generation_with_progress(
             rewritten = await _rewrite_blocked_shot(shot_dict)
             try:
                 video_path = await _generate_video_clip(
-                    client=client,
+                    client=video_client,
                     shot=rewritten,
                     scene_image_bytes=scene_image,
                     end_frame_bytes=end_frame,
@@ -387,6 +396,10 @@ async def _run_video_generation_with_progress(
             await db.commit()
             continue
 
+        # ── Save raw Veo clip path ──────────────────────────────────────
+        await update_job_shot_raw_video(db, job_id, shot_index=shot.shot_index, raw_video_path=video_path)
+        await db.commit()
+
         # ── TTS Voiceover + Merge ──────────────────────────────────────
         voiceover_text: str = shot.voiceover_text or ""
         if voiceover_text.strip():
@@ -403,6 +416,8 @@ async def _run_video_generation_with_progress(
                     voiceover_text=voiceover_text,
                     output_path=tts_path,
                 )
+                await update_job_shot_audio(db, job_id, shot_index=shot.shot_index, audio_path=tts_path)
+                await db.commit()
                 # Merge video + TTS audio into a single clip
                 merged_path = os.path.join(output_dir, f"merged_shot_{shot.shot_index:02d}.mp4")
                 merged_path = _merge_video_audio(
