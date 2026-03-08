@@ -1,3 +1,4 @@
+import asyncio
 import os
 from tenacity import RetryError
 from arq.connections import RedisSettings
@@ -219,68 +220,112 @@ async def _run_image_generation_with_progress(
     total_shots: int,
 ) -> None:
     """
-    Generate 2 scene images per shot and save both paths to DB.
+    Generate 2 scene images per shot — max 2 concurrent API calls (semaphore).
+    Retry logic lives here (not in shot_loop.py) so it's cancellation-aware:
+    - Semaphore is RELEASED during the retry wait → other slots can proceed.
+    - CancelledError always propagates — never swallowed.
+    - A watcher task polls DB every 3s and hard-cancels all tasks on job cancel.
     """
-    from google import genai
     from app.graph.nodes.shot_loop import _generate_scene_image
+    from app.core.exceptions import ImageGenerationError, VideoQuotaExhaustedError
+    from app.core.llm import get_image_genai_client
 
     settings = get_settings()
-    client = genai.Client(
-        vertexai=True,
-        api_key=settings.VERTEX_AI_API_KEY,
-    )
+    client = get_image_genai_client()
     output_dir = os.path.join(settings.OUTPUT_DIR, job_id)
     os.makedirs(output_dir, exist_ok=True)
 
-    for i, shot in enumerate(state.storyboard, start=1):
-        if await _check_cancellation(db, job_id):
+    semaphore = asyncio.Semaphore(1)
+    db_lock = asyncio.Lock()
+    completed_shots = 0
+
+    async def _gen_image(shot: dict) -> bytes:
+        """One image generation with inline retry. Semaphore released during wait."""
+        last_exc: Exception | None = None
+        for attempt in range(1, 6):
+            async with semaphore:
+                try:
+                    return await _generate_scene_image(
+                        client=client,
+                        shot=shot,
+                        product_bytes=state.product_image_bytes,
+                        reference_bytes=state.reference_image_bytes,
+                        reference_type=state.reference_image_type,
+                    )
+                except asyncio.CancelledError:
+                    raise  # never swallow
+                except VideoQuotaExhaustedError:
+                    raise  # non-retryable
+                except ImageGenerationError as e:
+                    last_exc = e
+                    if attempt == 5:
+                        raise
+                    wait = 15.0 if ("429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)) else min(4.0 * 2 ** (attempt - 1), 20.0)
+                    logger.warning(f"⚠️ Image attempt {attempt}/5 failed — retrying in {wait:.0f}s: {e}")
+            # Semaphore released — sleep outside so other slots can proceed
+            await asyncio.sleep(wait)
+        raise last_exc or ImageGenerationError("Max image attempts reached")
+
+    async def _process_shot(shot: dict, shot_num: int) -> None:
+        nonlocal completed_shots
+        try:
+            image_1 = await _gen_image(shot)
+            await asyncio.sleep(4)  # Delay between requests to avoid burst rate limits
+            image_2 = await _gen_image(shot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"❌ Shot {shot_num} image gen failed — skipping: {e}")
             return
 
-        await update_job_status(
-            db, job_id,
-            status=JobStatus.GENERATING_IMAGES,
-            completed_shots=i - 1,
-            progress_message=f"Generating images for shot {i}/{total_shots}...",
-        )
-        await db.commit()
+        async with db_lock:
+            img_path_1 = os.path.join(output_dir, f"scene_{shot['id']:02d}_a.png")
+            with open(img_path_1, "wb") as f:
+                f.write(image_1)
+            await update_job_shot_image(db, job_id, shot_index=shot_num, image_path=img_path_1, image_number=1)
+            await db.commit()
 
-        # Image option 1
-        image_1 = await _generate_scene_image(
-            client=client,
-            shot=shot,
-            product_bytes=state.product_image_bytes,
-            reference_bytes=state.reference_image_bytes,
-            reference_type=state.reference_image_type,
-        )
-        img_path_1 = os.path.join(output_dir, f"scene_{shot['id']:02d}_a.png")
-        with open(img_path_1, "wb") as f:
-            f.write(image_1)
-        await update_job_shot_image(db, job_id, shot_index=i, image_path=img_path_1, image_number=1)
-        await db.commit()
+            img_path_2 = os.path.join(output_dir, f"scene_{shot['id']:02d}_b.png")
+            with open(img_path_2, "wb") as f:
+                f.write(image_2)
+            await update_job_shot_image(db, job_id, shot_index=shot_num, image_path=img_path_2, image_number=2)
+            await db.commit()
 
-        # Image option 2
-        image_2 = await _generate_scene_image(
-            client=client,
-            shot=shot,
-            product_bytes=state.product_image_bytes,
-            reference_bytes=state.reference_image_bytes,
-            reference_type=state.reference_image_type,
-        )
-        img_path_2 = os.path.join(output_dir, f"scene_{shot['id']:02d}_b.png")
-        with open(img_path_2, "wb") as f:
-            f.write(image_2)
-        await update_job_shot_image(db, job_id, shot_index=i, image_path=img_path_2, image_number=2)
-        await db.commit()
+            completed_shots += 1
+            await update_job_status(
+                db, job_id,
+                status=JobStatus.GENERATING_IMAGES,
+                completed_shots=completed_shots,
+                progress_message=f"Shot {completed_shots}/{total_shots} images ready.",
+            )
+            await db.commit()
+            logger.info(f"📸 Shot {shot_num}/{total_shots} — both images saved [Job: {job_id}]")
 
-        # Mark this shot as completed for progress tracking
-        await update_job_status(
-            db, job_id,
-            status=JobStatus.GENERATING_IMAGES,
-            completed_shots=i,
-        )
-        await db.commit()
+    current_task = None
 
-        logger.info(f"📸 Shot {i}/{total_shots} — both images saved [Job: {job_id}]")
+    async def _watch_cancel() -> None:
+        """Polls DB every 3s — cancels current task the moment the job is cancelled.
+        Uses its OWN session to avoid concurrent access on the shared session."""
+        from app.core.database import AsyncSessionFactory
+        async with AsyncSessionFactory() as watch_db:
+            while True:
+                await asyncio.sleep(3)
+                if await _check_cancellation(watch_db, job_id):
+                    if current_task and not current_task.done():
+                        current_task.cancel()
+                    return
+
+    watcher = asyncio.create_task(_watch_cancel())
+    try:
+        for i, shot in enumerate(state.storyboard, start=1):
+            current_task = asyncio.create_task(_process_shot(shot, i))
+            try:
+                await current_task
+            except asyncio.CancelledError:
+                break
+    finally:
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
 
 
 # ── Internal: Video Generation Phase ─────────────────────────────────────────
@@ -290,13 +335,17 @@ async def _run_video_generation_with_progress(
     job_id: str,
 ) -> list[str]:
     """
-    For each shot that the user selected an image for:
-    - Load the selected image from filesystem
-    - Generate a video clip (with next shot's image as end frame)
-    - Save clip path to DB
-    Returns list of generated video clip paths in shot order.
+    Generate video clips for selected shots — max 2 concurrent Veo calls (semaphore).
+    Same cancellation and retry pattern as image generation:
+    - Semaphore released during retry wait.
+    - CancelledError always re-raised.
+    - Watcher polls DB every 3s and hard-cancels all tasks on job cancel.
+    - Results collected in a dict, returned sorted by shot_index for assembly.
     """
-    from app.core.exceptions import VideoSafetyFilterError
+    from app.core.exceptions import (
+        VideoSafetyFilterError, VideoRateLimitError,
+        VideoQuotaExhaustedError, VideoGenerationError,
+    )
     from app.graph.nodes.shot_loop import _generate_video_clip, _generate_tts_audio, _rewrite_blocked_shot
     from app.graph.nodes.assembly import _merge_video_audio
     from app.core.llm import get_genai_client, get_video_genai_client
@@ -311,30 +360,52 @@ async def _run_video_generation_with_progress(
     total = len(selected_shots)
     logger.info(f"🎬 Video generation starting — {total} selected shots [Job: {job_id}]")
 
-    # Pre-load all selected images for end-frame pairing
     scene_images: list[bytes] = []
     for shot in selected_shots:
         img_path = shot.scene_image_path if shot.selected_image == 1 else shot.scene_image_path_2
         with open(img_path, "rb") as f:  # type: ignore[arg-type]
             scene_images.append(f.read())
 
-    generated_video_paths: list[str] = []
+    video_semaphore = asyncio.Semaphore(1)
+    db_lock = asyncio.Lock()
+    results: dict[int, str] = {}
+    completed_count = 0
 
-    for i, (shot, scene_image) in enumerate(zip(selected_shots, scene_images)):
-        if await _check_cancellation(db, job_id):
-            return generated_video_paths
+    async def _gen_video(shot_dict: dict, scene_image: bytes, end_frame: bytes | None) -> str:
+        """One video generation with inline retry. Semaphore released during wait."""
+        last_exc: Exception | None = None
+        for attempt in range(1, 3):  # max 2 attempts for video (expensive)
+            async with video_semaphore:
+                try:
+                    return await _generate_video_clip(
+                        client=video_client,
+                        shot=shot_dict,
+                        scene_image_bytes=scene_image,
+                        end_frame_bytes=end_frame,
+                        output_dir=output_dir,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except (VideoSafetyFilterError, VideoQuotaExhaustedError):
+                    raise  # non-retryable
+                except VideoRateLimitError as e:
+                    last_exc = e
+                    if attempt == 2:
+                        raise
+                    logger.warning("⚠️ Video rate limit — retrying in 65s")
+                    wait = 65.0
+                except (VideoGenerationError, Exception) as e:
+                    last_exc = e
+                    if attempt == 2:
+                        raise
+                    wait = min(4.0 * 2 ** (attempt - 1), 10.0)
+                    logger.warning(f"⚠️ Video attempt {attempt}/2 failed — retrying in {wait:.0f}s: {e}")
+            await asyncio.sleep(wait)
+        raise last_exc or VideoGenerationError("Max video attempts reached")
 
-        end_frame = scene_images[i + 1] if i + 1 < len(scene_images) else None
+    async def _process_shot(i: int, shot, scene_image: bytes, end_frame: bytes | None) -> None:
+        nonlocal completed_count
 
-        await update_job_status(
-            db, job_id,
-            status=JobStatus.GENERATING_VIDEOS,
-            completed_shots=i,
-            progress_message=f"Generating video clip {i + 1}/{total}: {shot.shot_type}...",
-        )
-        await db.commit()
-
-        # Build shot dict for video generation (uses stored prompts from DB)
         shot_dict: dict[str, object] = {
             "id": shot.shot_index,
             "type": shot.shot_type,
@@ -344,105 +415,101 @@ async def _run_video_generation_with_progress(
             "negative_prompt": shot.negative_prompt or "",
         }
 
-        if await _check_cancellation(db, job_id):
-            return generated_video_paths
+        async with db_lock:
+            await update_job_status(
+                db, job_id,
+                status=JobStatus.GENERATING_VIDEOS,
+                progress_message=f"Generating video clip {i + 1}/{total}: {shot.shot_type}...",
+            )
+            await db.commit()
 
         try:
-            video_path = await _generate_video_clip(
-                client=video_client,
-                shot=shot_dict,
-                scene_image_bytes=scene_image,
-                end_frame_bytes=end_frame,
-                output_dir=output_dir,
-            )
+            video_path = await _gen_video(shot_dict, scene_image, end_frame)
         except VideoSafetyFilterError:
-            logger.warning(f"\U0001f6e1\ufe0f Shot {shot.shot_index} blocked by safety filter — rewriting prompt...")
-            await update_job_status(
-                db, job_id,
-                status=JobStatus.GENERATING_VIDEOS,
-                progress_message=f"Shot {i + 1} blocked — rewriting prompt...",
-            )
-            await db.commit()
+            logger.warning(f"🛡️ Shot {shot.shot_index} blocked — rewriting prompt...")
             rewritten = await _rewrite_blocked_shot(shot_dict)
             try:
-                video_path = await _generate_video_clip(
-                    client=video_client,
-                    shot=rewritten,
-                    scene_image_bytes=scene_image,
-                    end_frame_bytes=end_frame,
-                    output_dir=output_dir,
-                )
-            except (VideoSafetyFilterError, RetryError):
+                video_path = await _gen_video(rewritten, scene_image, end_frame)
+            except Exception:
                 logger.error(f"🚫 Shot {shot.shot_index} skipped — still blocked after rewrite.")
-                await update_job_status(
-                    db, job_id,
-                    status=JobStatus.GENERATING_VIDEOS,
-                    progress_message=f"Shot {i + 1} skipped (safety filter).",
-                )
-                await db.commit()
-                continue
-        except RetryError as e:
-            # Rate limit hit — all retries exhausted. Skip this shot, keep going.
-            cause = str(e.last_attempt.exception()) if e.last_attempt else str(e)
-            logger.error(
-                f"\u23f3 Shot {shot.shot_index} skipped — rate limit exhausted after retries. "
-                f"Reason: {cause}"
-            )
-            await update_job_status(
-                db, job_id,
-                status=JobStatus.GENERATING_VIDEOS,
-                progress_message=f"Shot {i + 1} skipped (rate limit). Continuing...",
-            )
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"⏳ Shot {shot.shot_index} skipped — {e}")
+            return
+
+        async with db_lock:
+            await update_job_shot_raw_video(db, job_id, shot_index=shot.shot_index, raw_video_path=video_path)
             await db.commit()
-            continue
 
-        # ── Save raw Veo clip path ──────────────────────────────────────
-        await update_job_shot_raw_video(db, job_id, shot_index=shot.shot_index, raw_video_path=video_path)
-        await db.commit()
-
-        # ── TTS Voiceover + Merge ──────────────────────────────────────
         voiceover_text: str = shot.voiceover_text or ""
         if voiceover_text.strip():
             tts_path = os.path.join(output_dir, f"tts_shot_{shot.shot_index:02d}.wav")
             try:
-                await update_job_status(
-                    db, job_id,
-                    status=JobStatus.GENERATING_VIDEOS,
-                    progress_message=f"Generating voiceover for shot {i + 1}/{total}...",
-                )
-                await db.commit()
-                await _generate_tts_audio(
-                    client=client,
-                    voiceover_text=voiceover_text,
-                    output_path=tts_path,
-                )
-                await update_job_shot_audio(db, job_id, shot_index=shot.shot_index, audio_path=tts_path)
-                await db.commit()
-                # Merge video + TTS audio into a single clip
+                async with db_lock:
+                    await update_job_status(
+                        db, job_id,
+                        status=JobStatus.GENERATING_VIDEOS,
+                        progress_message=f"Generating voiceover for shot {i + 1}/{total}...",
+                    )
+                    await db.commit()
+                await _generate_tts_audio(client=client, voiceover_text=voiceover_text, output_path=tts_path)
+                async with db_lock:
+                    await update_job_shot_audio(db, job_id, shot_index=shot.shot_index, audio_path=tts_path)
+                    await db.commit()
                 merged_path = os.path.join(output_dir, f"merged_shot_{shot.shot_index:02d}.mp4")
-                merged_path = _merge_video_audio(
-                    video_path=video_path,
-                    audio_path=tts_path,
-                    output_path=merged_path,
-                )
+                merged_path = _merge_video_audio(video_path=video_path, audio_path=tts_path, output_path=merged_path)
                 video_path = merged_path
                 logger.info(f"🎧 Shot {shot.shot_index} — video + TTS merged [Job: {job_id}]")
+            except asyncio.CancelledError:
+                raise
             except Exception as tts_err:
-                logger.warning(
-                    f"⚠️ TTS/merge failed for shot {shot.shot_index} — using video-only fallback. "
-                    f"Error: {tts_err}"
-                )
+                logger.warning(f"⚠️ TTS/merge failed for shot {shot.shot_index} — using raw video: {tts_err}")
         else:
-            logger.warning(f"⚠️ Shot {shot.shot_index} has no voiceover_text — skipping TTS.")
+            logger.warning(f"⚠️ Shot {shot.shot_index} has no voiceover — skipping TTS.")
 
-        generated_video_paths.append(video_path)
-        await update_job_shot_video(db, job_id, shot_index=shot.shot_index, video_path=video_path)
-        await db.commit()
+        async with db_lock:
+            completed_count += 1
+            await update_job_shot_video(db, job_id, shot_index=shot.shot_index, video_path=video_path)
+            await update_job_status(
+                db, job_id,
+                status=JobStatus.GENERATING_VIDEOS,
+                completed_shots=completed_count,
+            )
+            await db.commit()
 
-    await update_job_status(db, job_id, status=JobStatus.GENERATING_VIDEOS, completed_shots=total)
-    await db.commit()
+        results[shot.shot_index] = video_path
+        logger.info(f"✅ Shot {shot.shot_index} complete [Job: {job_id}]")
 
-    return generated_video_paths
+    current_task = None
+
+    async def _watch_cancel() -> None:
+        """Polls DB every 3s — cancels current task the moment the job is cancelled.
+        Uses its OWN session to avoid concurrent access on the shared session."""
+        from app.core.database import AsyncSessionFactory
+        async with AsyncSessionFactory() as watch_db:
+            while True:
+                await asyncio.sleep(3)
+                if await _check_cancellation(watch_db, job_id):
+                    if current_task and not current_task.done():
+                        current_task.cancel()
+                    return
+
+    watcher = asyncio.create_task(_watch_cancel())
+    try:
+        for i, shot in enumerate(selected_shots):
+            end_frame = scene_images[i + 1] if i + 1 < len(scene_images) else None
+            current_task = asyncio.create_task(_process_shot(i, shot, scene_images[i], end_frame))
+            try:
+                await current_task
+            except asyncio.CancelledError:
+                break
+    finally:
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+
+    return [results[idx] for idx in sorted(results.keys())]
 
 
 # ── ARQ Worker Settings ────────────────────────────────────────────────────────

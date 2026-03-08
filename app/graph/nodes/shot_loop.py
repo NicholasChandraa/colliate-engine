@@ -6,7 +6,6 @@ import uuid
 import wave
 from google import genai
 from google.genai import types
-from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, retry_if_exception
 from typing import Any, cast
 from app.core.config import get_settings
 from app.core.exceptions import ImageGenerationError, VideoGenerationError, VideoRateLimitError, VideoSafetyFilterError, VideoQuotaExhaustedError
@@ -74,30 +73,6 @@ _REFERENCE_HINTS: dict[str, str] = {
 }
 
 
-def _should_retry_image(e: BaseException) -> bool:
-    if isinstance(e, VideoQuotaExhaustedError):
-        return False
-    # Always retry on image generation errors (including the 429s we catch and wrap)
-    return True
-
-def _image_retry_wait(retry_state: object) -> float:
-    """Wait longer specifically for rate limit errors."""
-    exc = retry_state.outcome.exception()  # type: ignore[union-attr]
-    if isinstance(exc, ImageGenerationError) and "429" in str(exc):
-        logger.warning(f"⏳ Image Gen Rate limit hit (429) — waiting 15s before retry...")
-        return 15.0
-    # Standard exponential backoff for other errors
-    attempt = retry_state.attempt_number  # type: ignore[union-attr]
-    return min(4.0 * (2 ** (attempt - 1)), 20.0)
-
-@retry(
-    stop=stop_after_attempt(5),
-    wait=_image_retry_wait,
-    retry=retry_if_exception(_should_retry_image),
-    before_sleep=lambda retry_state: logger.warning(
-        f"⚠️ Image Gen Failed (Attempt {retry_state.attempt_number}). Retrying..."
-    )
-)
 async def _generate_scene_image(
     client: genai.Client,
     shot: dict[str, object],
@@ -158,32 +133,6 @@ async def _generate_scene_image(
         raise ImageGenerationError(f"Shot {shot['id']}: image gen failed: {e}") from e
 
 
-def _video_retry_wait(retry_state: object) -> float:
-    """Wait 65s for rate limit errors, short exponential backoff for everything else."""
-    exc = retry_state.outcome.exception()  # type: ignore[union-attr]
-    if isinstance(exc, VideoRateLimitError):
-        logger.warning(f"⏳ Rate limit hit — waiting 65s before retry...")
-        return 65.0
-    attempt = retry_state.attempt_number  # type: ignore[union-attr]
-    return min(4.0 * (2 ** (attempt - 1)), 10.0)
-
-def _should_retry_video(e: BaseException) -> bool:
-    if isinstance(e, (VideoSafetyFilterError, VideoQuotaExhaustedError)):
-        return False
-    error_str = str(e)
-    # Stop immediately on bad request/invalid project errors
-    if "INVALID_ARGUMENT" in error_str or "RESOURCE_PROJECT_INVALID" in error_str:
-        return False
-    return isinstance(e, VideoGenerationError)
-
-@retry(
-    stop=stop_after_attempt(2),
-    wait=_video_retry_wait,
-    retry=retry_if_exception(_should_retry_video),
-    before_sleep=lambda retry_state: logger.warning(
-        f"⚠️ Video Gen Failed (Attempt {retry_state.attempt_number}). Retrying..."
-    )
-)
 async def _generate_video_clip(
     client: genai.Client,
     shot: dict[str, object],

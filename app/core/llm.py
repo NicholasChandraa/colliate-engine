@@ -15,6 +15,25 @@ def get_genai_client() -> genai.Client:
         api_key=settings.VERTEX_AI_API_KEY
     )
 
+def get_image_genai_client() -> genai.Client:
+    """
+    Client strictly for Image generation (gemini-3.1-flash-image-preview).
+    This model only supports the GLOBAL endpoint — regional endpoints return 404.
+    Uses project + ADC so quota is tracked in the user's GCP project.
+    """
+    settings = get_settings()
+    if settings.GCP_PROJECT:
+        return genai.Client(
+            vertexai=True,
+            project=settings.GCP_PROJECT,
+            location="global",
+        )
+    return genai.Client(
+        vertexai=True,
+        api_key=settings.VERTEX_AI_API_KEY,
+    )
+
+
 def get_video_genai_client() -> genai.Client:
     """
     Client strictly for Veo Video Generation.
